@@ -87,50 +87,7 @@ class RegimeProvider(ABC):
 
 
 # =============================================================================
-# 1. Trend filter (no external API, uses bar history)
-# -----------------------------------------------------------------------------
-# In a strong tech bull market (both legs above SMA200), short-spread trades
-# fade an uptrend -- raise the bar. Symmetric handling for downtrends.
-# =============================================================================
-class TrendProvider(RegimeProvider):
-    name = "trend"
-
-    def __init__(self, long_sym: str = "SMH", short_sym: str = "IGV",
-                 sma_window: int = 200):
-        self.long_sym = long_sym
-        self.short_sym = short_sym
-        self.sma_window = sma_window
-
-    @property
-    def enabled(self) -> bool:
-        return True
-
-    async def assess(self, session, bars):
-        adj = RegimeAdjustment()
-        long_close  = bars.get(self.long_sym,  pd.DataFrame()).get("close")
-        short_close = bars.get(self.short_sym, pd.DataFrame()).get("close")
-        if long_close is None or short_close is None:
-            return adj
-        if len(long_close)  < self.sma_window: return adj
-        if len(short_close) < self.sma_window: return adj
-
-        long_sma  = long_close.iloc[-self.sma_window:].mean()
-        short_sma = short_close.iloc[-self.sma_window:].mean()
-        long_up   = long_close.iloc[-1]  > long_sma
-        short_up  = short_close.iloc[-1] > short_sma
-
-        if long_up and short_up:
-            # Tech bull regime -- bias against fading the over-performer
-            adj.z_entry_mult *= 1.25
-            adj.notes.append("trend:both_uptrend->z_mult*1.25")
-        elif (not long_up) and (not short_up):
-            adj.z_entry_mult *= 1.15
-            adj.notes.append("trend:both_downtrend->z_mult*1.15")
-        return adj
-
-
-# =============================================================================
-# 2. Congressional flow (Quiver preferred, senate/house-stock-watcher fallback)
+# 1. Congressional flow (Quiver preferred, senate/house-stock-watcher fallback)
 # -----------------------------------------------------------------------------
 # Tracks net buy minus sell over a 30d window across each ETF's top holdings.
 # Significant net buying = informed bullish flow -> veto shorting that leg.
@@ -259,7 +216,7 @@ class CongressProvider(RegimeProvider):
 
 
 # =============================================================================
-# 3. FRED -- macro overlay (VIX + financial conditions)
+# 2. FRED -- macro overlay (VIX + financial conditions)
 # =============================================================================
 class FredProvider(RegimeProvider):
     name = "fred"
@@ -316,7 +273,7 @@ class FredProvider(RegimeProvider):
 
 
 # =============================================================================
-# 4. News sentiment via NewsAPI (lexicon scorer)
+# 3. News sentiment via NewsAPI (lexicon scorer)
 # -----------------------------------------------------------------------------
 # Crude but useful: extreme one-sided news flow on a leg => don't fade it.
 # =============================================================================
@@ -388,7 +345,7 @@ class NewsProvider(RegimeProvider):
 
 
 # =============================================================================
-# 5. Reddit / WSB pile-on detection via Quiver
+# 4. Reddit / WSB pile-on detection via Quiver
 # =============================================================================
 class WSBProvider(RegimeProvider):
     name = "wsb"
@@ -467,14 +424,13 @@ class RegimeAnalyzer:
         return merged
 
 
-def build_default_analyzer(long_sym: str = "SMH",
-                           short_sym: str = "IGV") -> RegimeAnalyzer:
-    """Read env vars, wire up whatever providers are configured."""
+def build_default_analyzer() -> RegimeAnalyzer:
+    """Read env vars, wire up whatever providers are configured.
+    NOTE: Trend filtering is now per-pair (Pair.trend_adjustment), not here."""
     quiver  = os.getenv("QUIVER_API_KEY") or None
     fred    = os.getenv("FRED_API_KEY")   or None
     newsapi = os.getenv("NEWSAPI_KEY")    or None
     providers: List[RegimeProvider] = [
-        TrendProvider(long_sym=long_sym, short_sym=short_sym, sma_window=200),
         CongressProvider(quiver_api_key=quiver, lookback_days=30),
         FredProvider(api_key=fred),
         NewsProvider(api_key=newsapi, hours_back=24),
