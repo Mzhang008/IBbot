@@ -45,6 +45,17 @@ from ib_insync import (
     util,
 )
 
+# Optional: load .env for regime API keys (QUIVER_API_KEY, FRED_API_KEY,
+# NEWSAPI_KEY). If python-dotenv isn't installed, env vars must be set
+# externally -- the bot still runs.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+from regime import build_default_analyzer, RegimeAdjustment
+
 
 # =============================================================================
 # Configuration -- all tunables centralised in one dataclass.
@@ -104,6 +115,11 @@ class TradingBot:
         self.bars: Dict[str, pd.DataFrame] = {}
         self.state: str = self.POS_FLAT
         self.log = self._configure_logger()
+        # Regime layer: pulls Congress / news / WSB / FRED in parallel each
+        # iteration and returns a RegimeAdjustment used to gate the signal.
+        self.regime = build_default_analyzer(
+            long_sym=cfg.long_leg, short_sym=cfg.short_leg,
+        )
 
     # ------------------------------------------------------------------ logging
     @staticmethod
@@ -325,12 +341,13 @@ class TradingBot:
     # =========================================================================
     # Position management
     # =========================================================================
-    async def enter_position(self, direction: str) -> None:
+    async def enter_position(self, direction: str, size_mult: float = 1.0) -> None:
         """
         Open the pair according to the spread direction:
           POS_SHORT_SPREAD -> SELL long_leg, BUY short_leg   (Z > +entry)
           POS_LONG_SPREAD  -> BUY  long_leg, SELL short_leg  (Z < -entry)
-        Sizing is dollar-neutral pre-weight, then inverse-variance scaled.
+        Sizing is inverse-variance weighted, then scaled by `size_mult`
+        coming from the regime layer (e.g. VIX-based de-risking).
         """
         if direction not in (self.POS_SHORT_SPREAD, self.POS_LONG_SPREAD):
             raise ValueError(direction)
@@ -341,14 +358,16 @@ class TradingBot:
         _, _, mid_long = await self._snapshot_quote(self.cfg.long_leg)
         _, _, mid_short = await self._snapshot_quote(self.cfg.short_leg)
 
-        notional_long = self.cfg.capital * weights[self.cfg.long_leg]
-        notional_short = self.cfg.capital * weights[self.cfg.short_leg]
-        qty_long = max(1, int(notional_long // mid_long))
+        # Regime-scaled gross exposure
+        gross = self.cfg.capital * max(0.0, min(1.0, size_mult))
+        notional_long  = gross * weights[self.cfg.long_leg]
+        notional_short = gross * weights[self.cfg.short_leg]
+        qty_long  = max(1, int(notional_long  // mid_long))
         qty_short = max(1, int(notional_short // mid_short))
 
         self.log.info(
-            "ENTRY %s | w=%s | notional L=%.0f S=%.0f | qty L=%d S=%d",
-            direction,
+            "ENTRY %s | size_mult=%.2f | w=%s | notional L=%.0f S=%.0f | qty L=%d S=%d",
+            direction, size_mult,
             {k: round(v, 4) for k, v in weights.items()},
             notional_long, notional_short, qty_long, qty_short,
         )
@@ -421,18 +440,35 @@ class TradingBot:
                     await self.refresh_history()
                     spread = self.compute_spread()
                     z = self.compute_zscore(spread)
+
+                    # --- Regime overlay: external data adjusts threshold/size ---
+                    adj: RegimeAdjustment = await self.regime.assess(self.bars)
+                    eff_entry = self.cfg.z_entry * adj.z_entry_mult
+
                     self.log.info(
-                        "tick=%s | Z=%.3f | state=%s",
+                        "tick=%s | Z=%.3f | eff_entry=%.2f | state=%s | "
+                        "size_mult=%.2f vetoS=%s vetoL=%s",
                         datetime.utcnow().isoformat(timespec="seconds"),
-                        z, self.state,
+                        z, eff_entry, self.state,
+                        adj.size_mult, adj.veto_short_spread, adj.veto_long_spread,
                     )
 
-                    # --- Signal logic ---
+                    # --- Signal logic, gated by regime ---
                     if self.state == self.POS_FLAT:
-                        if z > self.cfg.z_entry:
-                            await self.enter_position(self.POS_SHORT_SPREAD)
-                        elif z < -self.cfg.z_entry:
-                            await self.enter_position(self.POS_LONG_SPREAD)
+                        if z > eff_entry and not adj.veto_short_spread:
+                            await self.enter_position(
+                                self.POS_SHORT_SPREAD, size_mult=adj.size_mult,
+                            )
+                        elif z < -eff_entry and not adj.veto_long_spread:
+                            await self.enter_position(
+                                self.POS_LONG_SPREAD, size_mult=adj.size_mult,
+                            )
+                        else:
+                            if (z > eff_entry and adj.veto_short_spread) or \
+                               (z < -eff_entry and adj.veto_long_spread):
+                                self.log.warning(
+                                    "Signal Z=%.2f suppressed by regime veto.", z,
+                                )
                     else:
                         if abs(z) < self.cfg.z_exit:
                             await self.close_positions()
