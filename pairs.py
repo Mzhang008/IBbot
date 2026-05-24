@@ -24,6 +24,12 @@ try:
 except ImportError:
     _HAS_STATSMODELS = False
 
+try:
+    from scipy.optimize import minimize
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
 
 # =============================================================================
 # Kalman filter for the hedge ratio: y_t = beta_t * x_t + v_t,
@@ -71,6 +77,81 @@ class KalmanHedgeRatio:
             resids.append(e)
             stds.append(s)
         return np.array(betas), np.array(resids), np.array(stds)
+
+
+def calibrate_kalman_mle(
+    ys: np.ndarray,
+    xs: np.ndarray,
+    init_delta: float = 1e-4,
+    init_R: float = 1e-3,
+    warmup: int = 30,
+) -> Tuple[float, float, bool]:
+    """
+    Calibrate (delta, R) by maximizing the Gaussian log-likelihood of the
+    innovation sequence:  ll = -0.5 * sum( log(2*pi*S_t) + e_t^2 / S_t )
+
+    Returns (delta, R, converged). Falls back to init values if scipy is
+    unavailable or optimisation diverges.
+    """
+    if not _HAS_SCIPY or len(ys) < warmup + 50:
+        return init_delta, init_R, False
+    ys = np.asarray(ys, dtype=float)
+    xs = np.asarray(xs, dtype=float)
+
+    def neg_ll(log_params):
+        delta = float(np.exp(log_params[0]))
+        R     = float(np.exp(log_params[1]))
+        kf = KalmanHedgeRatio(delta=delta, R=R)
+        _, resids, stds = kf.run_full(ys, xs)
+        e = resids[warmup:]
+        s = stds[warmup:]
+        if len(e) == 0 or np.any(s <= 0) or not np.isfinite(e).all():
+            return 1e10
+        return float(0.5 * np.sum(np.log(2.0 * np.pi * s * s) + (e * e) / (s * s)))
+
+    try:
+        res = minimize(
+            neg_ll,
+            x0=[np.log(init_delta), np.log(init_R)],
+            method="Nelder-Mead",
+            options={"xatol": 1e-4, "fatol": 1e-3, "maxiter": 300},
+        )
+        delta_opt = float(np.exp(res.x[0]))
+        R_opt = float(np.exp(res.x[1]))
+        # Sanity bounds
+        delta_opt = max(1e-8, min(1e-1, delta_opt))
+        R_opt     = max(1e-8, min(1.0,  R_opt))
+        return delta_opt, R_opt, bool(res.success)
+    except Exception:
+        return init_delta, init_R, False
+
+
+def ou_half_life(spread: np.ndarray) -> float:
+    """
+    Ornstein-Uhlenbeck half-life of a mean-reverting series, in bars.
+
+    Fit dS_t = alpha + lambda * S_{t-1} + eps.
+      lambda < 0 -> mean reverting; half-life = -ln(2) / lambda.
+      lambda >= 0 -> not mean reverting; return +inf.
+    """
+    s = np.asarray(spread, dtype=float)
+    s = s[~np.isnan(s)]
+    if len(s) < 30:
+        return float("inf")
+    s_lag = s[:-1]
+    ds = np.diff(s)
+    n = len(s_lag)
+    # Closed-form OLS for ds = a + b * s_lag
+    sx, sy = s_lag.sum(), ds.sum()
+    sxx = float(s_lag @ s_lag)
+    sxy = float(s_lag @ ds)
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return float("inf")
+    lam = (n * sxy - sx * sy) / denom
+    if lam >= 0:
+        return float("inf")
+    return float(-np.log(2.0) / lam)
 
 
 # =============================================================================
@@ -152,23 +233,34 @@ class Pair:
     # =========================================================================
     # Hedge ratio (Kalman, adaptive)
     # =========================================================================
-    def initialize_hedge_ratio(self) -> None:
-        """Run Kalman through ALL historical bars from scratch."""
+    def initialize_hedge_ratio(self, calibrate: bool = True) -> Tuple[float, float, bool]:
+        """
+        Run Kalman through ALL historical bars from scratch.
+        If `calibrate` and scipy available, fit (delta, R) by MLE first.
+        Returns (delta, R, calibrated_ok).
+        """
         closes = self._aligned_closes()
         if len(closes) < 30:
             raise ValueError(
                 f"{self.name}: need >=30 aligned bars, have {len(closes)}"
             )
-        # Reset filter state
-        self.kalman = KalmanHedgeRatio(
-            delta=self.kalman.Q, R=self.kalman.R,
-            beta0=1.0, P0=1.0,
-        )
         log_long  = np.log(closes[self.long_sym].values)
         log_short = np.log(closes[self.short_sym].values)
+
+        delta, R, ok = self.kalman.Q, self.kalman.R, False
+        if calibrate:
+            delta, R, ok = calibrate_kalman_mle(
+                log_long, log_short,
+                init_delta=self.kalman.Q,
+                init_R=self.kalman.R,
+            )
+
+        # Reset filter state with (possibly calibrated) params
+        self.kalman = KalmanHedgeRatio(delta=delta, R=R, beta0=1.0, P0=1.0)
         betas, resids, _ = self.kalman.run_full(log_long, log_short)
         self.beta_history   = pd.Series(betas,  index=closes.index)
         self.spread_history = pd.Series(resids, index=closes.index)
+        return delta, R, ok
 
     def update_hedge_ratio(self) -> int:
         """Step Kalman forward on bars that arrived after last update. Returns n_new."""
@@ -244,6 +336,31 @@ class Pair:
         p = self.cointegration_pvalue()
         self._coint_cache = (now, p)
         return p < p_threshold, p
+
+    # =========================================================================
+    # Half-life of mean reversion (cached alongside cointegration)
+    # =========================================================================
+    def half_life(self) -> float:
+        """OU half-life in bars on the latest `lookback` spread window."""
+        if len(self.spread_history) < 30:
+            return float("inf")
+        window = self.spread_history.iloc[-self.lookback:].values
+        return ou_half_life(window)
+
+    def is_tradable(
+        self, p_threshold: float, recheck_hours: int,
+        min_half_life_bars: float, max_half_life_bars: float,
+    ) -> Tuple[bool, float, float]:
+        """
+        Combined gate: cointegration AND half-life in [min, max] range.
+        Too-small half-life -> spread is noise, not a real reversion.
+        Too-large half-life -> reversion is too slow to monetise within time-stop.
+        Returns (tradable, p_value, half_life).
+        """
+        is_c, p = self.is_cointegrated(p_threshold, recheck_hours)
+        hl = self.half_life()
+        in_band = min_half_life_bars <= hl <= max_half_life_bars
+        return (is_c and in_band), p, hl
 
     # =========================================================================
     # Trend adjustment -- both-leg SMA regime filter

@@ -81,12 +81,28 @@ class Config:
     z_stop:  float = 4.0                 # hard loss-cut
     time_stop_hours: int = 240           # ~10 trading days @ hourly
 
-    # ---- Cointegration gate ----
+    # ---- Cointegration + half-life gate ----
     coint_pvalue_threshold: float = 0.05
     coint_recheck_hours: int = 24
+    min_half_life_bars: float = 5.0      # too fast -> noise, not reversion
+    max_half_life_bars: float = 120.0    # too slow -> won't monetise in time-stop
+
+    # ---- Kalman calibration ----
+    calibrate_kalman_on_init: bool = True
 
     # ---- Capital allocation ----
     capital_per_pair: float = 50_000.0
+
+    # ---- Portfolio-level risk caps ----
+    max_concurrent_pairs: int = 3
+    max_gross_notional: float = 200_000.0
+
+    # ---- Shortability ----
+    min_shortable_shares: int = 1000     # hard veto under this
+    shortability_recheck_hours: float = 4.0
+
+    # ---- Position reconciliation ----
+    reconcile_each_loop: bool = True
 
     # ---- Loop cadence ----
     poll_seconds: int = 3600
@@ -115,14 +131,33 @@ class TradingBot:
         self.cfg = cfg
         self.ib = IB()
         self.log = self._setup_logger()
+        specs = pair_specs or DEFAULT_PAIRS
+        self._validate_pair_specs(specs)
         self.pairs: List[Pair] = [
             Pair(long_sym=l, short_sym=s, lookback=cfg.lookback)
-            for l, s in (pair_specs or DEFAULT_PAIRS)
+            for l, s in specs
         ]
         self.contracts: Dict[str, Contract] = {}
         self.regime = build_default_analyzer()
+        # symbol -> (timestamp, shortable_shares)
+        self._shortability: Dict[str, Tuple[datetime, int]] = {}
         # IB Trade subscriptions for fill events -- bot reacts to broker reality
         self.ib.execDetailsEvent += self._on_exec_details
+
+    @staticmethod
+    def _validate_pair_specs(specs: List[Tuple[str, str]]) -> None:
+        """Each symbol may appear in at most one pair. Required so the
+        per-symbol broker position has unambiguous attribution during
+        reconciliation."""
+        seen: Dict[str, Tuple[str, str]] = {}
+        for l, s in specs:
+            for sym in (l, s):
+                if sym in seen:
+                    raise ValueError(
+                        f"Symbol {sym} appears in multiple pairs "
+                        f"({seen[sym]} and {(l, s)}); not supported."
+                    )
+                seen[sym] = (l, s)
 
     @staticmethod
     def _setup_logger() -> logging.Logger:
@@ -195,25 +230,40 @@ class TradingBot:
             p.long_contract  = self.contracts[p.long_sym]
             p.short_contract = self.contracts[p.short_sym]
 
-        # Shortability sanity check on the leg(s) we may short
-        await self._check_shortability()
-
-    async def _check_shortability(self) -> None:
-        """Log warning if a leg cannot be shorted. Strategy needs both directions."""
+    async def _refresh_shortability(self, symbol: str) -> int:
+        """Pull current shortable-shares inventory via tick 236. Cached."""
+        now = datetime.utcnow()
+        cached = self._shortability.get(symbol)
+        if cached is not None:
+            ts, sh = cached
+            age_h = (now - ts).total_seconds() / 3600.0
+            if age_h < self.cfg.shortability_recheck_hours:
+                return sh
+        shortable = 0
+        contract = self.contracts.get(symbol)
+        if contract is None:
+            return 0
         try:
-            for sym, contract in self.contracts.items():
-                t = self.ib.reqMktData(contract, genericTickList="236",
-                                       snapshot=False, regulatorySnapshot=False)
-                await asyncio.sleep(2.0)
-                shortable = getattr(t, "shortableShares", None)
-                if shortable is not None and shortable < 1000:
-                    self.log.warning(
-                        "%s low shortable inventory (%s shares). Borrow may be hard.",
-                        sym, shortable,
-                    )
-                self.ib.cancelMktData(contract)
+            t = self.ib.reqMktData(contract, genericTickList="236",
+                                   snapshot=False, regulatorySnapshot=False)
+            # Tick 236 populates shortableShares; let it arrive
+            for _ in range(20):
+                await asyncio.sleep(0.25)
+                val = getattr(t, "shortableShares", None)
+                if val is not None and val == val:   # not-NaN check
+                    shortable = int(val)
+                    break
+            try: self.ib.cancelMktData(contract)
+            except Exception: pass
         except Exception as e:
-            self.log.warning("Shortability check failed: %s", e)
+            self.log.warning("Shortability fetch failed for %s: %s", symbol, e)
+        self._shortability[symbol] = (now, shortable)
+        return shortable
+
+    async def _can_short(self, symbol: str, required_shares: int) -> Tuple[bool, int]:
+        """HARD veto -- returns (ok, available)."""
+        avail = await self._refresh_shortability(symbol)
+        return (avail >= max(required_shares, self.cfg.min_shortable_shares)), avail
 
     # =========================================================================
     # History I/O -- bulk load once, then incremental refresh
@@ -249,9 +299,13 @@ class TradingBot:
                 if p.short_sym == s: p.bars[s] = df.copy()
             self.log.info("Loaded %d %s bars (last=%s)", len(df), s, df.index[-1])
         for p in self.pairs:
-            p.initialize_hedge_ratio()
-            self.log.info("%s init: beta=%.3f, spread=%.5f",
-                          p.name, p.current_beta(), p.current_spread())
+            delta, R, ok = p.initialize_hedge_ratio(
+                calibrate=self.cfg.calibrate_kalman_on_init,
+            )
+            self.log.info(
+                "%s init: beta=%.3f spread=%.5f | Kalman delta=%.2e R=%.2e calibrated=%s",
+                p.name, p.current_beta(), p.current_spread(), delta, R, ok,
+            )
 
     async def refresh_pair(self, pair: Pair) -> None:
         """Append only the latest bars (~last 2 days), dedupe, sort."""
@@ -277,19 +331,26 @@ class TradingBot:
             self.log.debug("%s: no new bars, nothing to do", pair.name)
             return
 
-        # ---- Cointegration gate ----
-        is_coint, p_val = pair.is_cointegrated(
-            self.cfg.coint_pvalue_threshold, self.cfg.coint_recheck_hours,
+        # ---- Combined tradability gate: cointegration + half-life band ----
+        tradable, p_val, hl = pair.is_tradable(
+            p_threshold=self.cfg.coint_pvalue_threshold,
+            recheck_hours=self.cfg.coint_recheck_hours,
+            min_half_life_bars=self.cfg.min_half_life_bars,
+            max_half_life_bars=self.cfg.max_half_life_bars,
         )
-        if not is_coint:
+        if not tradable:
+            reason = []
+            if p_val >= self.cfg.coint_pvalue_threshold: reason.append(f"p={p_val:.3f}")
+            if hl < self.cfg.min_half_life_bars: reason.append(f"hl={hl:.1f}<min")
+            if hl > self.cfg.max_half_life_bars: reason.append(f"hl={hl:.1f}>max")
             if pair.state != Pair.POS_FLAT:
                 self.log.error(
-                    "%s COINTEGRATION BROKE (p=%.3f) while holding -> emergency flat",
-                    pair.name, p_val,
+                    "%s TRADABILITY BROKE (%s) while holding -> emergency flat",
+                    pair.name, ",".join(reason),
                 )
-                await self._close_pair(pair, reason="cointegration_broke")
+                await self._close_pair(pair, reason="tradability_broke")
             else:
-                self.log.info("%s skip: not cointegrated (p=%.3f)", pair.name, p_val)
+                self.log.info("%s skip: untradable (%s)", pair.name, ",".join(reason))
             return
 
         # ---- Z-score (no look-ahead) ----
@@ -310,23 +371,114 @@ class TradingBot:
         eff_entry = self.cfg.z_entry * macro.z_entry_mult * trend_mult
 
         self.log.info(
-            "%s | Z=%+.3f | eff=%.2f | state=%s | beta=%.3f | p_coint=%.3f | %s",
+            "%s | Z=%+.3f | eff=%.2f | state=%s | beta=%.3f | p_coint=%.3f | hl=%.1fb | %s",
             pair.name, z, eff_entry, pair.state,
-            pair.current_beta(), p_val, trend_note,
+            pair.current_beta(), p_val, hl, trend_note,
         )
 
-        # ---- Signal logic, gated by regime vetoes ----
+        # ---- Signal logic, gated by regime + portfolio caps + shortability ----
         if pair.state == Pair.POS_FLAT:
+            direction: Optional[str] = None
             if z > eff_entry and not macro.veto_short_spread:
-                await self._enter_pair(pair, Pair.POS_SHORT_SPREAD, z, macro)
+                direction = Pair.POS_SHORT_SPREAD
             elif z < -eff_entry and not macro.veto_long_spread:
-                await self._enter_pair(pair, Pair.POS_LONG_SPREAD, z, macro)
+                direction = Pair.POS_LONG_SPREAD
             elif (z > eff_entry and macro.veto_short_spread) or \
                  (z < -eff_entry and macro.veto_long_spread):
                 self.log.warning("%s signal Z=%.2f vetoed by regime", pair.name, z)
+            if direction is not None:
+                if not self._portfolio_caps_allow_new_entry(pair):
+                    self.log.warning(
+                        "%s entry blocked by portfolio caps", pair.name,
+                    )
+                    return
+                ok_short = await self._verify_short_inventory(pair, direction)
+                if not ok_short:
+                    self.log.warning(
+                        "%s entry blocked: insufficient borrow inventory", pair.name,
+                    )
+                    return
+                await self._enter_pair(pair, direction, z, macro)
         else:
             if abs(z) < self.cfg.z_exit:
                 await self._close_pair(pair, reason="z_exit")
+
+    # =========================================================================
+    # Portfolio-level risk caps
+    # =========================================================================
+    def _portfolio_snapshot(self) -> Tuple[int, float]:
+        """Returns (n_open_pairs, gross_notional_at_entry)."""
+        n_open = 0
+        gross = 0.0
+        for p in self.pairs:
+            if p.state == Pair.POS_FLAT or p.position is None:
+                continue
+            n_open += 1
+            gross += abs(p.position.qty_long)  * p.position.avg_price_long
+            gross += abs(p.position.qty_short) * p.position.avg_price_short
+        return n_open, gross
+
+    def _portfolio_caps_allow_new_entry(self, pair: Pair) -> bool:
+        n_open, gross = self._portfolio_snapshot()
+        if n_open >= self.cfg.max_concurrent_pairs:
+            self.log.warning(
+                "Portfolio cap: max_concurrent_pairs=%d hit (open=%d)",
+                self.cfg.max_concurrent_pairs, n_open,
+            )
+            return False
+        projected = gross + self.cfg.capital_per_pair
+        if projected > self.cfg.max_gross_notional:
+            self.log.warning(
+                "Portfolio cap: gross would be %.0f > %.0f",
+                projected, self.cfg.max_gross_notional,
+            )
+            return False
+        return True
+
+    async def _verify_short_inventory(self, pair: Pair, direction: str) -> bool:
+        """Before entry, check the symbol we're about to SELL has borrow."""
+        if direction == Pair.POS_SHORT_SPREAD:
+            short_sym = pair.long_sym             # we'll SELL the long-leg
+            price = pair.bars[short_sym]["close"].iloc[-1]
+        else:
+            short_sym = pair.short_sym            # we'll SELL the short-leg
+            price = pair.bars[short_sym]["close"].iloc[-1]
+        # Estimate qty needed (rough; actual sizing happens later)
+        est_qty = max(1, int((self.cfg.capital_per_pair / 2.0) // float(price)))
+        ok, avail = await self._can_short(short_sym, est_qty)
+        if not ok:
+            self.log.warning(
+                "Shortability veto on %s: need ~%d, have %d (min %d)",
+                short_sym, est_qty, avail, self.cfg.min_shortable_shares,
+            )
+        return ok
+
+    # =========================================================================
+    # Reconciliation -- compare tracked state to broker truth
+    # =========================================================================
+    async def _reconcile_positions(self) -> None:
+        """Cross-check every tracked symbol's broker position against the
+        Pair's expected qty_long / qty_short. Logs ERROR on drift.
+
+        Symbols are unique-per-pair (enforced at startup) so attribution is
+        unambiguous; broker positions in non-tracked symbols are ignored.
+        """
+        broker: Dict[str, int] = {
+            p.contract.symbol: int(p.position) for p in self.ib.positions()
+        }
+        for pair in self.pairs:
+            for sym, expected in (
+                (pair.long_sym,
+                 pair.position.qty_long  if pair.position else 0),
+                (pair.short_sym,
+                 pair.position.qty_short if pair.position else 0),
+            ):
+                actual = broker.get(sym, 0)
+                if actual != expected:
+                    self.log.error(
+                        "RECONCILE DRIFT %s/%s: tracked=%+d broker=%+d (delta=%+d)",
+                        pair.name, sym, expected, actual, actual - expected,
+                    )
 
     async def _check_stops(self, pair: Pair, z: float) -> bool:
         meta = pair.position
@@ -452,6 +604,12 @@ class TradingBot:
                             await self.process_pair(p, macro)
                         except Exception as e:
                             self.log.exception("Pair %s error: %s", p.name, e)
+
+                    if self.cfg.reconcile_each_loop:
+                        try:
+                            await self._reconcile_positions()
+                        except Exception as e:
+                            self.log.warning("Reconcile failed: %s", e)
 
                     await asyncio.sleep(self.cfg.poll_seconds)
 
